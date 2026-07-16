@@ -107,6 +107,18 @@ body { background: var(--bg); font-family: 'Syne', sans-serif; color: var(--text
 #msg-input::placeholder { color: var(--muted); }
 .send-btn { background: var(--accent); border: none; color: white; width: 38px; height: 38px; border-radius: 9px; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: opacity 0.2s; }
 .send-btn:hover { opacity: 0.85; }
+.attach-btn { background: var(--surface2); border: 0.5px solid var(--border); color: var(--muted); width: 38px; height: 38px; border-radius: 9px; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: color 0.2s, border-color 0.2s; }
+.attach-btn:hover { color: var(--accent2); border-color: var(--accent2); }
+.attach-btn:active { transform: scale(0.92); }
+
+/* ---- inline images ---- */
+.msg-bubble.has-image { padding: 4px; }
+.msg-image { display: block; width: 240px; max-width: 100%; max-height: 360px; object-fit: cover; border-radius: 9px; cursor: zoom-in; background: var(--surface2); }
+
+/* ---- fullscreen image viewer ---- */
+#image-viewer { display: none; position: absolute; inset: 0; background: rgba(5,5,7,0.94); backdrop-filter: blur(4px); z-index: 70; align-items: center; justify-content: center; padding: 1.5rem; cursor: zoom-out; }
+#image-viewer.show { display: flex; }
+#image-viewer img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 8px; }
 
 /* ---- incoming call modal ---- */
 .modal { display: none; position: absolute; inset: 0; background: rgba(8,8,11,0.78); backdrop-filter: blur(6px); align-items: center; justify-content: center; z-index: 50; }
@@ -165,6 +177,8 @@ body { background: var(--bg); font-family: 'Syne', sans-serif; color: var(--text
   .call-controls { width: 100%; max-width: 92%; flex-wrap: wrap; justify-content: center; gap: 0.7rem; }
   .call-ctrl { width: 52px; height: 52px; font-size: 1.15rem; }   /* fits 5 buttons on a 320px screen */
   .reply-btn, .react-chip { padding: 0.25rem 0.65rem; font-size: 0.82rem; }
+  .attach-btn { width: 40px; height: 40px; }
+  .msg-image { width: 200px; }
 }
 
 /* ---- screen share fits the viewer (contain, not crop) ---- */

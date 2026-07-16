@@ -25,6 +25,7 @@ ES modules under `public/js/`:
 
 ## Features
 - Messaging, presence, typing, reply, reactions (❤️ 🥀 💀), read receipts (sent → seen)
+- Picture sending — attach button, paste, or drag-drop; encrypted client-side (same AES-GCM channel as text); originals up to ~5 MB sent at full resolution/quality, only larger ones downscaled (≤2560px, high quality); tap to view full-screen
 - Unsend (deletes the bubble on both sides)
 - Auto-reconnect: silently re-auths/re-joins after dropped sockets
 - Voice + video calls — mic & camera start MUTED; tap to enable

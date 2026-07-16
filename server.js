@@ -6,7 +6,7 @@ const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: false } });
+const io = new Server(server, { cors: { origin: false }, maxHttpBufferSize: 8_000_000 });
 
 /* ---------------- AUTH (challenge-response) ---------------- */
 const ROOM_PASSWORD = process.env.ROOM_PASSWORD || 'oviyaandakshar';
@@ -70,6 +70,8 @@ const EMOJI = ['\u2764\uFE0F', '\u{1F940}', '\u{1F480}']; // ❤️ 🥀 💀
 const ALLOWED_EMOJI = new Set(EMOJI);
 const MAX_NAME = 20;
 const MAX_CIPHERTEXT = 8000;
+const MAX_IMAGE_CIPHERTEXT = 7_000_000;   // base64 of an encrypted image (~5 MB binary); client keeps originals at full quality under this
+const ALLOWED_IMAGE_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const MAX_SDP = 200000;       // SDP blobs are a few KB; cap generously
 const newId = () => crypto.randomBytes(9).toString('base64url');
 const clientIp = s => s.handshake.headers['x-forwarded-for']?.split(',')[0].trim() || s.handshake.address || 'unknown';
@@ -116,6 +118,21 @@ io.on('connection', (socket) => {
     if (payload.ct.length > MAX_CIPHERTEXT) return;
     io.to('main').emit('message', {
       id: newId(), senderId: socket.id, senderName: socket.username, payload,
+      replyToId: typeof replyToId === 'string' ? replyToId.slice(0, 32) : null,
+      time: new Date().toISOString()
+    });
+  });
+
+  socket.on('image', ({ payload, replyToId } = {}) => {
+    if (!socket.authed || !payload) return;
+    if (typeof payload.iv !== 'string' || typeof payload.ct !== 'string') return;
+    if (typeof payload.mime !== 'string' || !ALLOWED_IMAGE_MIME.has(payload.mime)) return;
+    if (payload.iv.length > 64 || payload.ct.length > MAX_IMAGE_CIPHERTEXT) return;
+    const w = Math.min(20000, Math.max(0, Number(payload.w) || 0));
+    const h = Math.min(20000, Math.max(0, Number(payload.h) || 0));
+    io.to('main').emit('image', {
+      id: newId(), senderId: socket.id, senderName: socket.username,
+      payload: { iv: payload.iv, ct: payload.ct, mime: payload.mime, w, h },
       replyToId: typeof replyToId === 'string' ? replyToId.slice(0, 32) : null,
       time: new Date().toISOString()
     });

@@ -37,6 +37,62 @@ async function decryptText(msgKey, p) {
   const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(p.iv) }, msgKey, fromB64(p.ct));
   return _dec.decode(pt);
 }
+// Images ride the same AES-GCM channel as text — the server only ever relays ciphertext.
+async function encryptBytes(msgKey, bytes) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, msgKey, bytes);
+  return { iv: toB64(iv), ct: toB64(ct) };
+}
+async function decryptBytes(msgKey, p) {
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(p.iv) }, msgKey, fromB64(p.ct));
+  return new Uint8Array(pt);
+}
+
+/* ============================ IMAGES ============================ */
+// High quality by design: originals are sent byte-for-byte whenever they fit the transmit cap
+// (full resolution, no re-encode). Only images larger than the cap are downscaled — and even
+// then at a generous edge/quality — so ordinary photos never lose detail.
+const IMG_MAX_DIM = 2560;                 // longest edge, only applied to oversized images
+const IMG_SEND_MAX = 5_000_000;           // hard cap on the bytes we actually transmit (~5 MB)
+const PASS_THROUGH_MAX = 5_000_000;       // originals up to this are sent untouched, full quality
+const ALLOWED_IMG_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+const canvasToBlob = (canvas, type, q) => new Promise(res => canvas.toBlob(res, type, q));
+// Prefer WebP (smaller at equal quality) and fall back to JPEG where the browser can't encode it.
+async function encodeCanvas(canvas, quality) {
+  const webp = await canvasToBlob(canvas, 'image/webp', quality);
+  if (webp && webp.type === 'image/webp') return webp;
+  return canvasToBlob(canvas, 'image/jpeg', quality);
+}
+
+// Decode via createImageBitmap (works off a Blob directly — no blob: URL, so the strict
+// img-src CSP is never involved). Originals within the cap pass through untouched (keeps PNG
+// transparency / GIF animation / full quality); only oversized images are downscaled and
+// re-encoded, high quality first, easing off only as much as needed to fit the cap.
+async function prepareImage(file) {
+  if (!file.type.startsWith('image/')) throw new Error('not an image');
+  const bmp = await createImageBitmap(file);
+  const w0 = bmp.width, h0 = bmp.height;
+  try {
+    if (file.size <= PASS_THROUGH_MAX && ALLOWED_IMG_MIME.has(file.type)) {
+      return { bytes: new Uint8Array(await file.arrayBuffer()), mime: file.type, w: w0, h: h0 };
+    }
+    let scale = Math.min(1, IMG_MAX_DIM / Math.max(w0, h0)), quality = 0.92;
+    for (let pass = 0; pass < 7; pass++) {
+      const w = Math.max(1, Math.round(w0 * scale)), h = Math.max(1, Math.round(h0 * scale));
+      const canvas = document.createElement('canvas'); canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(bmp, 0, 0, w, h);
+      const blob = await encodeCanvas(canvas, quality);
+      if (blob && (blob.size <= IMG_SEND_MAX || pass === 6)) {
+        return { bytes: new Uint8Array(await blob.arrayBuffer()), mime: blob.type || 'image/jpeg', w, h };
+      }
+      if (quality > 0.7) quality -= 0.08; else scale *= 0.85;
+    }
+    throw new Error('could not compress');
+  } finally { if (bmp.close) bmp.close(); }
+}
 
 /* ============================ CALLS ============================ */
 const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }];
@@ -294,10 +350,30 @@ class ChatUI {
     inp.addEventListener('blur', () => this._stopTyping());
     document.addEventListener('visibilitychange', () => this.flushSeen());
     window.addEventListener('focus', () => this.flushSeen());
+
+    // --- picture sending: button, paste, drag-drop ---
+    const fileInput = $('file-input');
+    $('attach-btn').addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => { const files = [...fileInput.files]; fileInput.value = ''; files.forEach(f => this.sendImage(f)); });
+    inp.addEventListener('paste', e => {
+      const items = (e.clipboardData && e.clipboardData.items) || [];
+      for (const it of items) if (it.type.startsWith('image/')) { const f = it.getAsFile(); if (f) { e.preventDefault(); this.sendImage(f); } }
+    });
+    const chatEl = $('chat');
+    ['dragover', 'dragenter'].forEach(ev => chatEl.addEventListener(ev, e => e.preventDefault()));
+    chatEl.addEventListener('drop', e => {
+      e.preventDefault();
+      const files = (e.dataTransfer && e.dataTransfer.files) || [];
+      [...files].forEach(f => { if (f.type.startsWith('image/')) this.sendImage(f); });
+    });
+    // --- fullscreen image viewer ---
+    $('image-viewer').addEventListener('click', () => this._closeViewer());
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') this._closeViewer(); });
   }
   _bindSocket() {
     const s = this.socket;
     s.on('message', m => this._onMessage(m));
+    s.on('image', m => this._onImage(m));
     s.on('react', d => this._onReact(d));
     s.on('seen', d => this._onSeen(d));
     s.on('typing', d => this._onTyping(d));
@@ -319,7 +395,31 @@ class ChatUI {
     this._render({ ...m, text, undecryptable });
     if (m.senderId !== this.selfId) { this.unseen.add(m.id); this.flushSeen(); }
   }
-  _render({ id, senderId, senderName, text, time, replyToId, undecryptable }) {
+  async sendImage(file) {
+    if (!this.msgKey || !file) return;
+    let prep;
+    try { prep = await prepareImage(file); }
+    catch (e) { this.addSystem('couldn’t process that image'); return; }
+    const replyToId = this.replyTarget ? this.replyTarget.id : null;
+    try {
+      const enc = await encryptBytes(this.msgKey, prep.bytes);
+      this.socket.emit('image', { payload: { ...enc, mime: prep.mime, w: prep.w, h: prep.h }, replyToId });
+    } catch (e) { this.addSystem('couldn’t send that image'); return; }
+    this._clearReply();
+  }
+  async _onImage(m) {
+    let src = '', undecryptable = false;
+    const p = m.payload || {};
+    const mime = ALLOWED_IMG_MIME.has(p.mime) ? p.mime : 'image/jpeg';
+    try { src = `data:${mime};base64,${toB64(await decryptBytes(this.msgKey, p))}`; }
+    catch (e) { undecryptable = true; }
+    if (!undecryptable) this.msgStore.set(m.id, { name: m.senderName, text: '📷 photo' });
+    this._render({ ...m, image: src, imgW: p.w, imgH: p.h, undecryptable });
+    if (m.senderId !== this.selfId) { this.unseen.add(m.id); this.flushSeen(); }
+  }
+  _openViewer(src) { $('viewer-img').src = src; $('image-viewer').classList.add('show'); }
+  _closeViewer() { const v = $('image-viewer'); if (v.classList.contains('show')) { v.classList.remove('show'); $('viewer-img').removeAttribute('src'); } }
+  _render({ id, senderId, senderName, text, time, replyToId, undecryptable, image, imgW, imgH }) {
     const box = $('messages'); const mine = senderId === this.selfId;
     const w = document.createElement('div'); w.className = 'msg ' + (mine ? 'self' : 'other'); w.dataset.id = id;
     const meta = document.createElement('div'); meta.className = 'msg-meta'; meta.textContent = `${senderName} · ${fmtTime(time)}`; w.appendChild(meta);
@@ -330,7 +430,16 @@ class ChatUI {
       const qt = document.createElement('span'); qt.className = 'q-text'; qt.textContent = q.text;
       quote.appendChild(qn); quote.appendChild(qt); bubble.appendChild(quote);
     }
-    const body = document.createElement('span'); body.textContent = undecryptable ? '⚠ unable to decrypt this message' : text; bubble.appendChild(body);
+    if (image && !undecryptable) {
+      bubble.classList.add('has-image');
+      const el = document.createElement('img'); el.className = 'msg-image'; el.alt = 'shared photo'; el.decoding = 'async';
+      if (imgW && imgH) el.style.aspectRatio = imgW + ' / ' + imgH;
+      el.addEventListener('load', () => { box.scrollTop = box.scrollHeight; });
+      el.addEventListener('click', e => { e.stopPropagation(); this._openViewer(image); });
+      el.src = image; bubble.appendChild(el);
+    } else {
+      const body = document.createElement('span'); body.textContent = undecryptable ? '⚠ unable to decrypt this message' : text; bubble.appendChild(body);
+    }
     bubble.addEventListener('click', () => w.classList.toggle('actions-open'));
     w.appendChild(bubble);
     if (mine) { const st = document.createElement('div'); st.className = 'msg-status'; st.textContent = 'sent'; w.appendChild(st); }
